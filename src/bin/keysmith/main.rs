@@ -258,7 +258,6 @@ type Sent = Mutex<VecDeque<(u32, String, String)>>;
 /// Blocks SIGHUP everywhere (threads inherit the mask) and re-execs on it.
 fn reload_on_sighup() {
     use nix::sys::signal::{SigSet, Signal};
-    use std::os::unix::process::CommandExt;
     let mut set = SigSet::empty();
     set.add(Signal::SIGHUP);
     if set.thread_block().is_err() {
@@ -267,12 +266,18 @@ fn reload_on_sighup() {
     std::thread::spawn(move || {
         if set.wait().is_ok() {
             log("reloading");
-            let exe = std::env::current_exe().unwrap_or_else(|_| "keysmith".into());
-            // exec only returns on failure. Our sockets are CLOEXEC, so inputd sees a new client.
-            let e = Command::new(exe).args(std::env::args_os().skip(1)).exec();
-            report("reload", &e.to_string());
+            reexec();
         }
     });
+}
+
+/// Restart in place (same pid). Only returns if exec fails.
+fn reexec() {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().unwrap_or_else(|_| "keysmith".into());
+    // Our sockets are CLOEXEC, so inputd sees the old client go and a new one arrive.
+    let e = Command::new(exe).args(std::env::args_os().skip(1)).exec();
+    report("reload", &e.to_string());
 }
 
 fn main() -> ExitCode {
@@ -316,12 +321,18 @@ fn main() -> ExitCode {
 
     // Engine-side override for testing against a fake inputd; inputd's path is fixed.
     let socket = std::env::var("KEYSMITH_SOCKET").unwrap_or_else(|_| SOCKET.into());
-    let sock = match UnixStream::connect(&socket) {
-        Ok(s) => s,
-        Err(e) => {
-            log(&format!("cannot reach ks-inputd at {socket}: {e}"));
-            let _ = std::fs::write(rd.join("status.json"), json!({"error": "ks-inputd is not running"}).to_string());
-            return ExitCode::FAILURE;
+    // Started at login, possibly before inputd: wait for it rather than exit.
+    let mut warned = false;
+    let sock = loop {
+        match UnixStream::connect(&socket) {
+            Ok(s) => break s,
+            Err(e) => {
+                if !std::mem::replace(&mut warned, true) {
+                    log(&format!("waiting for ks-inputd at {socket}: {e}"));
+                    let _ = std::fs::write(rd.join("status.json"), json!({"error": "ks-inputd is not running"}).to_string());
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
     };
     let writer = Arc::new(Mutex::new(sock.try_clone().expect("socket clone")));
@@ -419,9 +430,11 @@ fn main() -> ExitCode {
             _ => eprintln!("keysmith: unexpected {line:?}"),
         }
     }
-    // inputd went away (restart or user switch); systemd restarts us.
+    // inputd went away (restart, upgrade, or this session lost the seat): start over.
     log("disconnected from ks-inputd");
     let _ = std::fs::write(rd.join("status.json"), json!({"error": "disconnected from ks-inputd"}).to_string());
+    std::thread::sleep(Duration::from_secs(2));
+    reexec();
     ExitCode::FAILURE
 }
 

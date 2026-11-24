@@ -136,7 +136,7 @@ impl Ui {
             self.list.remove(&row);
         }
         let banner = match (running, status["error"].as_str()) {
-            (false, _) => "The engine is not running. Start it with `keysmith` or `systemctl --user start keysmith`.".into(),
+            (false, _) => "The engine is not running. It starts at login; to start it now, run `keysmith &` in a terminal.".into(),
             (true, Some(e)) => format!("Engine problem: {e}"),
             (true, None) => format!("Engine running · {} rules", status["rules"]),
         };
@@ -144,6 +144,13 @@ impl Ui {
         let dir = PathBuf::from(status["config_dir"].as_str().unwrap_or_default());
         for s in status["scripts"].as_array().into_iter().flatten() {
             self.list.append(&self.row(&dir, s));
+        }
+        if running && status["scripts"].as_array().is_none_or(|a| a.is_empty()) {
+            let hint = format!(
+                "No scripts yet. Put .luau files in {}/scripts/ — examples are in /usr/share/doc/keysmith/examples/.",
+                dir.display()
+            );
+            self.list.append(&gtk4::Label::builder().label(&hint).wrap(true).margin_top(12).margin_bottom(12).build());
         }
     }
 
@@ -297,7 +304,7 @@ fn build(app: &gtk4::Application) -> Rc<Ui> {
 
 fn main() -> glib::ExitCode {
     let tray_only = std::env::args().any(|a| a == "--tray");
-    let app = gtk4::Application::builder().application_id("io.github.keysmith.Manager").build();
+    let app = gtk4::Application::builder().application_id("io.github.fagostini.Keysmith").build();
     let ui: Rc<RefCell<Option<Rc<Ui>>>> = Rc::default();
     let started = Rc::new(std::cell::Cell::new(false));
     app.connect_activate(move |app| {

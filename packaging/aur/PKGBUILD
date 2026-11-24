@@ -1,0 +1,51 @@
+# Maintainer: Federico Agostini <1116545+fagostini@users.noreply.github.com>
+pkgname=keysmith
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Hotkeys, key remaps, text expansion and Luau scripts for Wayland and X11'
+arch=('x86_64' 'aarch64')
+url='https://github.com/fagostini/keysmith'
+license=('GPL-3.0-or-later')
+depends=('glibc' 'libgcc' 'libstdc++' 'glib2' 'gtk4' 'libxkbcommon' 'systemd')
+makedepends=('cargo')
+# Luau (C++) objects built with GCC LTO can't be linked by rust-lld.
+options=('!lto' '!debug')
+backup=('etc/xdg/autostart/io.github.fagostini.Keysmith.Engine.desktop'
+        'etc/xdg/autostart/io.github.fagostini.Keysmith.Tray.desktop')
+optdepends=('xclip: paste characters your layout cannot type (X11)'
+            'wl-clipboard: paste characters your layout cannot type (Wayland)'
+            'libnotify: error notifications')
+install=keysmith.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release --features ui
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 -t "$pkgdir/usr/bin" target/release/{ks-inputd,keysmith,ks-ui}
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/system" data/systemd/ks-inputd.service
+  install -Dm644 -t "$pkgdir/usr/share/applications" data/applications/*.desktop
+  install -Dm644 -t "$pkgdir/etc/xdg/autostart" data/autostart/*.desktop
+  local ext=keysmith@fagostini.github.io
+  install -Dm644 -t "$pkgdir/usr/share/gnome-shell/extensions/$ext" data/gnome-extension/$ext/*
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples" examples/hotkeys.conf README.md
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples/scripts" examples/scripts/*
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

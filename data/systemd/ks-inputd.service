@@ -1,10 +1,12 @@
 [Unit]
 Description=Keysmith input broker (evdev reader, hotkey matcher)
-Documentation=file:///usr/share/doc/keysmith/README.md
+Documentation=https://github.com/fagostini/keysmith
 
 [Service]
-ExecStart=/usr/local/bin/ks-inputd
+ExecStart=/usr/bin/ks-inputd
 Restart=on-failure
+# Exit 2 = emergency exit (Backspace+Esc+Enter): stay stopped until restarted by hand.
+RestartPreventExitStatus=2
 RuntimeDirectory=keysmith
 RuntimeDirectoryMode=0755
 DevicePolicy=closed

@@ -2,7 +2,12 @@
 name = "keysmith"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
+description = "Hotkeys, key remaps, text expansion and Luau scripts for Wayland and X11"
+repository = "https://github.com/fagostini/keysmith"
+readme = "README.md"
+authors = ["Federico Agostini <1116545+fagostini@users.noreply.github.com>"]
 
 # ponytail: one crate, three binaries. Each links only the crates it uses, but all
 # compile together; split into a workspace if build times or packaging need it.
@@ -34,3 +39,58 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+strip = true
+
+# .deb: `cargo deb` (cargo install cargo-deb)
+[package.metadata.deb]
+features = ["ui"]
+section = "utils"
+depends = "$auto, systemd"
+recommends = "xclip | wl-clipboard, libnotify-bin"
+extended-description = """\
+Keysmith brings AutoHotkey-style automation to Linux on Wayland and X11:
+global hotkeys, key remaps with tap/hold, hotstrings, and sandboxed Luau
+scripts that can react to the focused window. A small root service
+(ks-inputd) reads the keyboard and never lets raw keystrokes leave it."""
+assets = [
+    ["target/release/ks-inputd", "usr/bin/", "755"],
+    ["target/release/keysmith", "usr/bin/", "755"],
+    ["target/release/ks-ui", "usr/bin/", "755"],
+    ["data/applications/io.github.fagostini.Keysmith.desktop", "usr/share/applications/", "644"],
+    ["data/autostart/*.desktop", "etc/xdg/autostart/", "644"],
+    ["data/gnome-extension/keysmith@fagostini.github.io/*", "usr/share/gnome-shell/extensions/keysmith@fagostini.github.io/", "644"],
+    ["examples/hotkeys.conf", "usr/share/doc/keysmith/examples/", "644"],
+    ["examples/scripts/*", "usr/share/doc/keysmith/examples/scripts/", "644"],
+    ["README.md", "usr/share/doc/keysmith/", "644"],
+]
+conf-files = []
+maintainer-scripts = "packaging/debian/"
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "data/systemd"
+unit-name = "ks-inputd"
+enable = true
+start = true
+restart-after-upgrade = true
+
+# .rpm: `cargo generate-rpm` after `cargo build --release --features ui`
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/ks-inputd", dest = "/usr/bin/ks-inputd", mode = "755" },
+    { source = "target/release/keysmith", dest = "/usr/bin/keysmith", mode = "755" },
+    { source = "target/release/ks-ui", dest = "/usr/bin/ks-ui", mode = "755" },
+    { source = "data/systemd/ks-inputd.service", dest = "/usr/lib/systemd/system/ks-inputd.service", mode = "644" },
+    { source = "data/applications/io.github.fagostini.Keysmith.desktop", dest = "/usr/share/applications/", mode = "644" },
+    { source = "data/autostart/*.desktop", dest = "/etc/xdg/autostart/", mode = "644", config = "noreplace" },
+    { source = "data/gnome-extension/keysmith@fagostini.github.io/*", dest = "/usr/share/gnome-shell/extensions/keysmith@fagostini.github.io/", mode = "644" },
+    { source = "examples/hotkeys.conf", dest = "/usr/share/doc/keysmith/examples/hotkeys.conf", mode = "644", doc = true },
+    { source = "examples/scripts/*", dest = "/usr/share/doc/keysmith/examples/scripts/", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/keysmith/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/keysmith/LICENSE", mode = "644" },
+]
+post_install_script = "systemctl daemon-reload >/dev/null 2>&1 || :; if [ $1 -eq 1 ]; then systemctl enable --now ks-inputd.service >/dev/null 2>&1 || :; else systemctl try-restart ks-inputd.service >/dev/null 2>&1 || :; fi"
+pre_uninstall_script = "if [ $1 -eq 0 ]; then systemctl disable --now ks-inputd.service >/dev/null 2>&1 || :; fi"
+post_uninstall_script = "systemctl daemon-reload >/dev/null 2>&1 || :"
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"

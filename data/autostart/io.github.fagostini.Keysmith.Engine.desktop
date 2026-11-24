@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Keysmith engine
+Comment=Runs your Keysmith hotkeys and scripts
+Exec=keysmith
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=2

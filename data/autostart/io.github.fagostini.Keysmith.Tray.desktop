@@ -1,7 +1,7 @@
-# Install to ~/.config/autostart/ (or /etc/xdg/autostart/) for the tray icon at login.
 [Desktop Entry]
 Type=Application
 Name=Keysmith tray
+Comment=Tray icon for the Keysmith manager
 Exec=ks-ui --tray
 Icon=input-keyboard
 NoDisplay=true

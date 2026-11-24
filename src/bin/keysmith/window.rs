@@ -91,7 +91,7 @@ fn serve(on_focus: OnFocus) -> Result<zbus::blocking::Connection, String> {
 
 fn gnome(on_focus: OnFocus) -> Result<(), String> {
     let _conn = serve(on_focus)?;
-    let ext = "keysmith@keysmith.github.io";
+    let ext = "keysmith@fagostini.github.io";
     let ok = std::process::Command::new("gnome-extensions")
         .args(["info", ext])
         .output()

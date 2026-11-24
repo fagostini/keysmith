@@ -1,0 +1,13 @@
+post_install() {
+  systemctl daemon-reload
+  systemctl enable --now ks-inputd.service
+  echo ':: Log out and back in to start the Keysmith engine and tray.'
+  echo ':: GNOME: gnome-extensions enable keysmith@fagostini.github.io'
+}
+post_upgrade() {
+  systemctl daemon-reload
+  systemctl try-restart ks-inputd.service
+}
+pre_remove() {
+  systemctl disable --now ks-inputd.service
+}
