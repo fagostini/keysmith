@@ -1,0 +1,11 @@
+[package]
+name = "keysmith"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+# ponytail: one crate, two binaries. Split into ks-inputd / ks-engine crates
+# when the engine grows deps (zbus, mlua) that inputd must not link.
+[dependencies]
+evdev = "0.13"
+nix = { version = "0.29", features = ["socket"] }
