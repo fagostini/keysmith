@@ -316,13 +316,22 @@ impl State {
                 self.flush_queue();
                 None
             }
-            Ok(Msg::Pasted(id)) => {
+            Ok(Msg::Pasted(id, shift)) => {
                 if self.pending_paste == Some(id) {
                     self.pending_paste = None;
                     let v = self.layout.as_ref().and_then(|(l, _)| l.key_for('v')).unwrap_or(KeyCode::KEY_V);
-                    // ponytail: always Ctrl+V; terminals want Ctrl+Shift+V once M5 knows the window class.
-                    self.inject(&[(KeyCode::KEY_LEFTCTRL, 1), (v, 1), (v, 0), (KeyCode::KEY_LEFTCTRL, 0)]);
+                    let (ctrl, sh) = (KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT);
+                    let keys: &[_] = if shift {
+                        &[(ctrl, 1), (sh, 1), (v, 1), (v, 0), (sh, 0), (ctrl, 0)]
+                    } else {
+                        &[(ctrl, 1), (v, 1), (v, 0), (ctrl, 0)]
+                    };
+                    self.inject(keys);
                 }
+                None
+            }
+            Ok(Msg::Focus) => {
+                self.hs.reset();
                 None
             }
         };

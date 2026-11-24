@@ -1,0 +1,6 @@
+{
+  "uuid": "keysmith@keysmith.github.io",
+  "name": "Keysmith window info",
+  "description": "Tells the keysmith engine which window is focused, so scripts can use window.class and window.title.",
+  "shell-version": ["45", "46", "47", "48", "49"]
+}

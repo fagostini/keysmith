@@ -1,0 +1,7 @@
+GNOME Shell doesn't expose the focused window to other programs, so keysmith
+ships a tiny extension that reports it over D-Bus.
+
+Install:
+  cp -r keysmith@keysmith.github.io ~/.local/share/gnome-shell/extensions/
+  # Wayland: log out and back in (GNOME only scans for extensions at login)
+  gnome-extensions enable keysmith@keysmith.github.io

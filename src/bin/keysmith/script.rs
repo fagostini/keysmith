@@ -1,11 +1,12 @@
 //! Luau script host. Each script gets its own thread and its own sandboxed `Lua`;
 //! scripts never see key events, only their own callbacks being called.
 
-use mlua::{Function, Lua, LuaOptions, StdLib, Table, Value, Variadic, VmState};
+use mlua::{Compiler, Function, Lua, LuaOptions, StdLib, Table, Value, Variadic, VmState};
 use std::cell::{Cell, RefCell};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
+use crate::window::Window;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,6 +54,7 @@ fn reap(mut child: std::process::Child) {
 
 /// Builds the sandboxed state and API. `regs` is Some only while the top level runs.
 fn setup(
+    win: Arc<Mutex<Window>>,
     name: &str,
     run_allowed: bool,
     send: SendFn,
@@ -144,6 +146,22 @@ fn setup(
             Ok(())
         })?,
     )?;
+    // `window.class` / `window.title`: read live from the window backend.
+    let window = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.set(
+        "__index",
+        lua.create_function(move |_, (_, k): (Value, String)| {
+            let w = win.lock().unwrap();
+            Ok(match k.as_str() {
+                "class" => Some(w.class.clone()),
+                "title" => Some(w.title.clone()),
+                _ => None,
+            })
+        })?,
+    )?;
+    window.set_metatable(Some(meta))?;
+    g.set("window", window)?;
     let n = name.to_owned();
     g.set("notify", lua.create_function(move |_, msg: String| {
         report(&n, &msg);
@@ -164,7 +182,7 @@ fn setup(
 }
 
 /// Runs the script's top level on its own thread; returns what it registered.
-pub fn spawn(name: String, src: String, send: SendFn) -> Result<Loaded, String> {
+pub fn spawn(name: String, src: String, send: SendFn, win: Arc<Mutex<Window>>) -> Result<Loaded, String> {
     let run_allowed = capabilities(&src).iter().any(|c| c == "run");
     let (done_tx, done_rx) = sync_channel(1);
     let (tx, rx) = channel::<usize>();
@@ -172,8 +190,13 @@ pub fn spawn(name: String, src: String, send: SendFn) -> Result<Loaded, String> 
         let deadline = Rc::new(Cell::new(Instant::now() + BUDGET));
         let regs = Rc::new(RefCell::new(Some(Vec::new())));
         let cbs = Rc::new(RefCell::new(Vec::new()));
-        let loaded = setup(&name, run_allowed, send, deadline.clone(), regs.clone(), cbs.clone())
-            .and_then(|lua| lua.load(&src).set_name(&name).exec().map(|_| lua));
+        let loaded = setup(win, &name, run_allowed, send, deadline.clone(), regs.clone(), cbs.clone())
+            .and_then(|lua| {
+                // `window` changes under the script: stop Luau caching `window.class`
+                // at load time (import resolution), or callbacks see the startup value.
+                let compiler = Compiler::new().set_mutable_globals(["window"]);
+                lua.load(&src).set_name(&name).set_compiler(compiler).exec().map(|_| lua)
+            });
         let lua = match loaded {
             Ok(lua) => lua,
             Err(e) => return drop(done_tx.send(Err(e.to_string()))),
@@ -195,7 +218,10 @@ pub fn spawn(name: String, src: String, send: SendFn) -> Result<Loaded, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+
+    fn spawn(name: String, src: String, send: SendFn) -> Result<Loaded, String> {
+        super::spawn(name, src, send, Arc::new(Mutex::new(Window { class: "firefox".into(), title: "t".into() })))
+    }
 
     fn load(src: &str) -> Result<Loaded, String> {
         spawn("t.luau".into(), src.into(), Arc::new(|_, _| Ok(())))
@@ -210,6 +236,7 @@ mod tests {
             remap("rightalt", "leftmeta")
             hotstring("btw", "by the way")
             hotstring(";dt", function() send(os.date("%Y-%m-%d")) end, {immediate=true})
+            assert(window.class == "firefox" and window.title == "t" and window.nope == nil)
             "#,
         )
         .unwrap();
@@ -254,6 +281,25 @@ mod tests {
         load("--! capabilities: run\nrun('true')").unwrap();
         assert!(err("sleep(1) hotkey('f5', function() end) local f = function() hotkey('f6', function() end) end f() error('x')").contains('x'));
         assert_eq!(capabilities("--!strict\n--! capabilities: run, fs\nprint(1)"), vec!["run", "fs"]);
+    }
+
+    #[test]
+    fn window_is_live() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let send: SendFn = Arc::new(move |_, t| {
+            g.lock().unwrap().push(t.to_owned());
+            Ok(())
+        });
+        let win = Arc::new(Mutex::new(Window::default()));
+        let l = super::spawn("w.luau".into(), r#"hotkey("f5", function() send(window.class) end)"#.into(), send, win.clone()).unwrap();
+        win.lock().unwrap().class = "firefox".into();
+        l.tx.send(0).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        win.lock().unwrap().class = "kitty".into();
+        l.tx.send(0).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(*got.lock().unwrap(), vec!["firefox", "kitty"]);
     }
 
     #[test]

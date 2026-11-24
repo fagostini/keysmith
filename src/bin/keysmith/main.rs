@@ -3,8 +3,10 @@
 //!
 //!   keysmith [CONFIG]        run (default ~/.config/keysmith/hotkeys.conf)
 //!   keysmith trust SCRIPT    approve a script's declared capabilities
+//!   keysmith windows         print focus changes (tests the window backend)
 
 mod script;
+mod window;
 
 use keysmith::{SOCKET, escape, parse_msg, unescape};
 use script::{Reg, SendFn, report};
@@ -18,6 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use window::Window;
 
 enum Target {
     Cmd(String),
@@ -160,7 +163,7 @@ fn trust(script: &Path) -> Result<(), String> {
 }
 
 /// Loads every `scripts/*.luau`; a broken script is reported and skipped.
-fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn) -> Vec<Sender<usize>> {
+fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn, win: &Arc<Mutex<Window>>) -> Vec<Sender<usize>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir.join("scripts"))
         .into_iter()
         .flatten()
@@ -179,7 +182,7 @@ fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn) -> Vec<Sender<
             report(&name, &format!("wants capabilities [{}]; run `{cmd}` to allow (again after edits)", caps.join(", ")));
             continue;
         }
-        let loaded = match script::spawn(name.clone(), src, send.clone()) {
+        let loaded = match script::spawn(name.clone(), src, send.clone(), win.clone()) {
             Ok(l) => l,
             Err(e) => {
                 report(&name, &e);
@@ -232,13 +235,30 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().is_some_and(|a| a == "windows") {
+        let name = window::start(Arc::new(|w: Window| println!("{:?}  {:?}", w.class, w.title)));
+        return match name {
+            Ok(name) => {
+                eprintln!("window backend {name}; switch windows, Ctrl+C to stop");
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(e) => {
+                eprintln!("keysmith: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let conf = args.into_iter().next().unwrap_or_else(config_path);
     let dir = conf.parent().unwrap_or(Path::new(".")).to_owned();
 
-    let sock = match UnixStream::connect(SOCKET) {
+    // Engine-side override for testing against a fake inputd; inputd's path is fixed.
+    let socket = std::env::var("KEYSMITH_SOCKET").unwrap_or_else(|_| SOCKET.into());
+    let sock = match UnixStream::connect(&socket) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("keysmith: cannot reach ks-inputd at {SOCKET}: {e}");
+            eprintln!("keysmith: cannot reach ks-inputd at {socket}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -267,7 +287,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let scripts = load_scripts(&dir, &mut rules, &send);
+    let win = Arc::new(Mutex::new(Window::default()));
+    let scripts = load_scripts(&dir, &mut rules, &send, &win);
     let layout = layout_line(&xkb);
     {
         let mut w = writer.lock().unwrap();
@@ -277,7 +298,19 @@ fn main() -> ExitCode {
             }
         }
     }
-    eprintln!("keysmith: {} rules, {} scripts, {layout}", rules.len(), scripts.len());
+    let backend = {
+        let (w, win) = (writer.clone(), win.clone());
+        window::start(Arc::new(move |now: Window| {
+            *win.lock().unwrap() = now;
+            // inputd only learns *that* focus changed (to reset the hotstring buffer).
+            let _ = writeln!(w.lock().unwrap(), "focus");
+        }))
+    };
+    let backend = backend.unwrap_or_else(|e| {
+        report("window", &e);
+        "none"
+    });
+    eprintln!("keysmith: {} rules, {} scripts, {layout}, window backend {backend}", rules.len(), scripts.len());
 
     for line in BufReader::new(sock).lines().map_while(Result::ok) {
         let mut parts = line.splitn(3, ' ');
@@ -301,7 +334,8 @@ fn main() -> ExitCode {
                 let Some(text) = text else { continue };
                 match clipboard_set(&text) {
                     Ok(old) => {
-                        let _ = writeln!(writer.lock().unwrap(), "pasted {}", id.unwrap_or(0));
+                        let term = window::is_terminal(&win.lock().unwrap().class);
+                        let _ = writeln!(writer.lock().unwrap(), "pasted {} {}", id.unwrap_or(0), if term { "s" } else { "-" });
                         if let Some(old) = old {
                             std::thread::spawn(move || {
                                 std::thread::sleep(Duration::from_secs(1));
@@ -334,6 +368,7 @@ mod tests {
     fn example_scripts() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         let send: SendFn = Arc::new(|_, _| Ok(()));
+        let win = Arc::new(Mutex::new(Window::default()));
         let mut rules = Vec::new();
         let mut n = 0;
         for e in std::fs::read_dir(dir.join("scripts")).unwrap() {
@@ -341,12 +376,12 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let src = std::fs::read_to_string(&path).unwrap();
             // Loaded directly: capabilities are exercised without the trust step.
-            let loaded = script::spawn(name.clone(), src, send.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let loaded = script::spawn(name.clone(), src, send.clone(), win.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!loaded.regs.is_empty(), "{name} registers nothing");
             n += 1;
         }
         assert!(n >= 20, "only {n} example scripts");
-        load_scripts(&dir, &mut rules, &send);
+        load_scripts(&dir, &mut rules, &send, &win);
         for r in &rules {
             match parse_msg(&r.wire) {
                 Ok(keysmith::Msg::Bind(_, c)) => assert!(c.refusal().is_none(), "{}: inputd would refuse {}", r.origin, r.wire),

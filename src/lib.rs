@@ -4,7 +4,7 @@
 //!   engine -> inputd: `bind <id> <combo>` | `remap <id> <key> <action>` | `taphold_ms <ms>`
 //!                     `layout <layout> <variant|-> <options|->`
 //!                     `hotstring <id> <opts> <trigger> <replacement>` | `pasted <id>`
-//!                     `type <id> <text>`   (opts: `-`, `*` immediate, `f` callback)
+//!                     `type <id> <text>` | `focus` (window changed; no details)   (opts: `-`, `*` immediate, `f` callback)
 //!   inputd -> engine: `fired <id>` | `paste <id>` | `err <id> <reason>`
 //! Hotstrings are matched and typed inside inputd; the engine only hears about one
 //! when it has a script callback (`fired`) or its text needs the clipboard (`paste`).
@@ -124,8 +124,10 @@ pub enum Msg {
     TapHoldMs(u64),
     Layout(String, String, String),
     Hotstring(u32, Hotstring),
-    Pasted(u32),
+    /// Clipboard is ready; `true` = paste with Ctrl+Shift+V (terminal).
+    Pasted(u32, bool),
     Type(u32, String),
+    Focus,
 }
 
 pub const MAX_TEXT: usize = 1000;
@@ -165,6 +167,9 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
             _ => Err((0, format!("taphold_ms must be 50..=2000, got {a:?}"))),
         };
     }
+    if verb == "focus" {
+        return Ok(Msg::Focus);
+    }
     if verb == "layout" {
         let mut w = line.split(' ').skip(1).map(|s| if s == "-" { "" } else { s }.to_owned());
         return Ok(Msg::Layout(w.next().unwrap_or_default(), w.next().unwrap_or_default(), w.next().unwrap_or_default()));
@@ -177,7 +182,7 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
             let (src, action) = rest.split_once(' ').ok_or_else(|| e(format!("bad remap {rest:?}")))?;
             Ok(Msg::Remap(id, key(src).map_err(e)?, action.parse().map_err(e)?))
         }
-        "pasted" => Ok(Msg::Pasted(id)),
+        "pasted" => Ok(Msg::Pasted(id, rest == "s")),
         "hotstring" => {
             let mut w = rest.splitn(3, ' ');
             let (opt, trigger, text) = (w.next().unwrap_or(""), w.next().unwrap_or(""), unescape(w.next().unwrap_or("")));
