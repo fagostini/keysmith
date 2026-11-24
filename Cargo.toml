@@ -4,12 +4,22 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
-# ponytail: one crate, two binaries. Split into ks-inputd / ks-engine crates
-# when the engine grows deps (zbus, mlua) that inputd must not link.
+# ponytail: one crate, three binaries. Each links only the crates it uses, but all
+# compile together; split into a workspace if build times or packaging need it.
+[features]
+# GTK manager + tray (`ks-ui`). Off by default so inputd and the engine build without GTK.
+ui = ["dep:gtk4", "dep:ksni"]
+
+[[bin]]
+name = "ks-ui"
+required-features = ["ui"]
+
 [dependencies]
+gtk4 = { version = "0.11", features = ["v4_10"], optional = true }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"], optional = true }
 evdev = "0.13"
 mlua = { version = "0.11", features = ["luau"] }
-nix = { version = "0.29", features = ["socket", "ioctl"] }
+nix = { version = "0.29", features = ["socket", "ioctl", "signal"] }
 serde_json = "1"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

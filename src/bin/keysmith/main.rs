@@ -4,12 +4,16 @@
 //!   keysmith [CONFIG]        run (default ~/.config/keysmith/hotkeys.conf)
 //!   keysmith trust SCRIPT    approve a script's declared capabilities
 //!   keysmith windows         print focus changes (tests the window backend)
+//!
+//! SIGHUP reloads (re-execs). State for the manager UI lives in `run_dir()`:
+//! `status.json` (per-script state), `engine.log`, `pid`.
 
 mod script;
 mod window;
 
 use keysmith::{SOCKET, escape, parse_msg, unescape};
-use script::{Reg, SendFn, report};
+use script::{Reg, SendFn, log, report};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
@@ -35,6 +39,17 @@ struct Rule {
     origin: String,
     wire: String,
     target: Target,
+}
+
+/// `$XDG_RUNTIME_DIR/keysmith`: per-session, user-owned, wiped at logout.
+pub fn run_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join("keysmith")
+}
+
+/// Script names listed in `<config>/disabled`, one per line.
+fn disabled(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("disabled")).unwrap_or_default().lines().map(|l| l.trim().to_owned()).collect()
 }
 
 fn config_path() -> PathBuf {
@@ -163,7 +178,15 @@ fn trust(script: &Path) -> Result<(), String> {
 }
 
 /// Loads every `scripts/*.luau`; a broken script is reported and skipped.
-fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn, win: &Arc<Mutex<Window>>) -> Vec<Sender<usize>> {
+/// Loads every enabled `scripts/*.luau`; a broken script is reported and skipped.
+/// `status` gets one entry per script for the manager UI.
+fn load_scripts(
+    dir: &Path,
+    rules: &mut Vec<Rule>,
+    send: &SendFn,
+    win: &Arc<Mutex<Window>>,
+    status: &mut Vec<serde_json::Value>,
+) -> Vec<Sender<usize>> {
     let mut paths: Vec<_> = std::fs::read_dir(dir.join("scripts"))
         .into_iter()
         .flatten()
@@ -173,22 +196,34 @@ fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn, win: &Arc<Mute
         .collect();
     paths.sort();
     let mut scripts = Vec::new();
+    let off = disabled(dir);
     for path in paths {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let Ok(src) = std::fs::read_to_string(&path) else { continue };
         let caps = script::capabilities(&src);
+        let mut st = |state: &str, msg: &str| {
+            status.push(json!({"name": name, "path": path, "state": state, "message": msg, "caps": caps}));
+        };
+        if off.contains(&name) {
+            st("disabled", "");
+            continue;
+        }
         if !caps.is_empty() && !is_trusted(dir, &name, &src) {
             let cmd = format!("keysmith trust {}", path.display());
-            report(&name, &format!("wants capabilities [{}]; run `{cmd}` to allow (again after edits)", caps.join(", ")));
+            let msg = format!("wants capabilities [{}]; allow it in the manager or run `{cmd}`", caps.join(", "));
+            report(&name, &msg);
+            st("untrusted", &msg);
             continue;
         }
         let loaded = match script::spawn(name.clone(), src, send.clone(), win.clone()) {
             Ok(l) => l,
             Err(e) => {
                 report(&name, &e);
+                st("error", &e);
                 continue;
             }
         };
+        st("loaded", "");
         let si = scripts.len();
         for reg in loaded.regs {
             let id = rules.len();
@@ -219,6 +254,26 @@ fn load_scripts(dir: &Path, rules: &mut Vec<Rule>, send: &SendFn, win: &Arc<Mute
 
 /// Recently `send()`-ed texts by request id, for `paste` and `err` replies.
 type Sent = Mutex<VecDeque<(u32, String, String)>>;
+
+/// Blocks SIGHUP everywhere (threads inherit the mask) and re-execs on it.
+fn reload_on_sighup() {
+    use nix::sys::signal::{SigSet, Signal};
+    use std::os::unix::process::CommandExt;
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGHUP);
+    if set.thread_block().is_err() {
+        return;
+    }
+    std::thread::spawn(move || {
+        if set.wait().is_ok() {
+            log("reloading");
+            let exe = std::env::current_exe().unwrap_or_else(|_| "keysmith".into());
+            // exec only returns on failure. Our sockets are CLOEXEC, so inputd sees a new client.
+            let e = Command::new(exe).args(std::env::args_os().skip(1)).exec();
+            report("reload", &e.to_string());
+        }
+    });
+}
 
 fn main() -> ExitCode {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -252,13 +307,20 @@ fn main() -> ExitCode {
     }
     let conf = args.into_iter().next().unwrap_or_else(config_path);
     let dir = conf.parent().unwrap_or(Path::new(".")).to_owned();
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    reload_on_sighup();
+    let rd = run_dir();
+    let _ = std::fs::create_dir_all(&rd);
+    let _ = std::fs::write(rd.join("engine.log"), "");
+    let _ = std::fs::write(rd.join("pid"), std::process::id().to_string());
 
     // Engine-side override for testing against a fake inputd; inputd's path is fixed.
     let socket = std::env::var("KEYSMITH_SOCKET").unwrap_or_else(|_| SOCKET.into());
     let sock = match UnixStream::connect(&socket) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("keysmith: cannot reach ks-inputd at {socket}: {e}");
+            log(&format!("cannot reach ks-inputd at {socket}: {e}"));
+            let _ = std::fs::write(rd.join("status.json"), json!({"error": "ks-inputd is not running"}).to_string());
             return ExitCode::FAILURE;
         }
     };
@@ -288,7 +350,10 @@ fn main() -> ExitCode {
         }
     };
     let win = Arc::new(Mutex::new(Window::default()));
-    let scripts = load_scripts(&dir, &mut rules, &send, &win);
+    let mut status = Vec::new();
+    let scripts = load_scripts(&dir, &mut rules, &send, &win, &mut status);
+    let status = json!({"config_dir": dir, "scripts": status, "rules": rules.len()});
+    let _ = std::fs::write(rd.join("status.json"), status.to_string());
     let layout = layout_line(&xkb);
     {
         let mut w = writer.lock().unwrap();
@@ -310,7 +375,7 @@ fn main() -> ExitCode {
         report("window", &e);
         "none"
     });
-    eprintln!("keysmith: {} rules, {} scripts, {layout}, window backend {backend}", rules.len(), scripts.len());
+    log(&format!("{} rules, {} scripts, {layout}, window backend {backend}", rules.len(), scripts.len()));
 
     for line in BufReader::new(sock).lines().map_while(Result::ok) {
         let mut parts = line.splitn(3, ' ');
@@ -355,7 +420,8 @@ fn main() -> ExitCode {
         }
     }
     // inputd went away (restart or user switch); systemd restarts us.
-    eprintln!("keysmith: disconnected");
+    log("disconnected from ks-inputd");
+    let _ = std::fs::write(rd.join("status.json"), json!({"error": "disconnected from ks-inputd"}).to_string());
     ExitCode::FAILURE
 }
 
@@ -381,7 +447,7 @@ mod tests {
             n += 1;
         }
         assert!(n >= 20, "only {n} example scripts");
-        load_scripts(&dir, &mut rules, &send, &win);
+        load_scripts(&dir, &mut rules, &send, &win, &mut Vec::new());
         for r in &rules {
             match parse_msg(&r.wire) {
                 Ok(keysmith::Msg::Bind(_, c)) => assert!(c.refusal().is_none(), "{}: inputd would refuse {}", r.origin, r.wire),

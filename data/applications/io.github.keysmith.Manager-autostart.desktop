@@ -1,0 +1,8 @@
+# Install to ~/.config/autostart/ (or /etc/xdg/autostart/) for the tray icon at login.
+[Desktop Entry]
+Type=Application
+Name=Keysmith tray
+Exec=ks-ui --tray
+Icon=input-keyboard
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Keysmith
+Comment=Manage hotkeys, remaps and automation scripts
+Exec=ks-ui
+Icon=input-keyboard
+Categories=Utility;Settings;
+Keywords=hotkey;shortcut;remap;macro;automation;

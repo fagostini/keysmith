@@ -42,9 +42,19 @@ pub fn capabilities(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// Log line to stderr and the runtime log the manager UI shows.
+pub fn log(line: &str) {
+    eprintln!("keysmith: {line}");
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(crate::run_dir().join("engine.log"));
+    if let Ok(mut f) = f {
+        let _ = std::io::Write::write_all(&mut f, format!("{h:02}:{m:02}:{s:02} UTC  {line}\n").as_bytes());
+    }
+}
+
 pub fn report(origin: &str, msg: &str) {
-    eprintln!("keysmith: {origin}: {msg}");
-    // ponytail: desktop notification stands in for the M6 UI error view.
+    log(&format!("{origin}: {msg}"));
     let _ = Command::new("notify-send").args(["-a", "keysmith", &format!("keysmith: {origin}"), msg]).spawn().map(reap);
 }
 
@@ -172,7 +182,7 @@ fn setup(
         "print",
         lua.create_function(move |_, args: Variadic<Value>| {
             let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect::<mlua::Result<_>>()?;
-            eprintln!("[{n}] {}", parts.join("\t"));
+            log(&format!("[{n}] {}", parts.join("\t")));
             Ok(())
         })?,
     )?;
