@@ -2,9 +2,15 @@
 //!
 //! Wire protocol: newline-delimited text over a Unix socket.
 //!   engine -> inputd: `bind <id> <combo>` | `remap <id> <key> <action>` | `taphold_ms <ms>`
-//!   inputd -> engine: `fired <id>` | `err <id> <reason>`
+//!                     `layout <layout> <variant|-> <options|->`
+//!                     `hotstring <id> <*|-> <trigger> <replacement>` | `pasted <id>`
+//!   inputd -> engine: `fired <id>` | `paste <id>` | `err <id> <reason>`
+//! Hotstrings are matched and typed inside inputd; the engine only hears about one
+//! when its text needs the clipboard (`paste`).
 //! Raw key events never cross the socket; only match IDs do.
 // ponytail: text lines instead of bincode frames; switch when messages carry structured data.
+
+pub mod xkb;
 
 use evdev::KeyCode;
 use std::collections::{HashMap, HashSet};
@@ -115,6 +121,29 @@ pub enum Msg {
     Bind(u32, Combo),
     Remap(u32, KeyCode, Action),
     TapHoldMs(u64),
+    Layout(String, String, String),
+    Hotstring(u32, Hotstring),
+    Pasted(u32),
+}
+
+pub const MIN_TRIGGER: usize = 3;
+
+/// `\n`, `\t` and `\\` escapes in hotstring replacements.
+pub fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match (c, c == '\\') {
+            (_, true) => match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(o) => out.push(o),
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Parses one engine -> inputd line. Errors carry the id when one was readable.
@@ -127,6 +156,10 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
             _ => Err((0, format!("taphold_ms must be 50..=2000, got {a:?}"))),
         };
     }
+    if verb == "layout" {
+        let mut w = line.split(' ').skip(1).map(|s| if s == "-" { "" } else { s }.to_owned());
+        return Ok(Msg::Layout(w.next().unwrap_or_default(), w.next().unwrap_or_default(), w.next().unwrap_or_default()));
+    }
     let id: u32 = a.parse().map_err(|_| (0, format!("bad message {line:?}")))?;
     let e = |m: String| (id, m);
     match verb {
@@ -135,7 +168,68 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
             let (src, action) = rest.split_once(' ').ok_or_else(|| e(format!("bad remap {rest:?}")))?;
             Ok(Msg::Remap(id, key(src).map_err(e)?, action.parse().map_err(e)?))
         }
+        "pasted" => Ok(Msg::Pasted(id)),
+        "hotstring" => {
+            let mut w = rest.splitn(3, ' ');
+            let (opt, trigger, text) = (w.next().unwrap_or(""), w.next().unwrap_or(""), unescape(w.next().unwrap_or("")));
+            if trigger.chars().count() < MIN_TRIGGER {
+                return Err(e(format!("hotstring trigger needs at least {MIN_TRIGGER} characters")));
+            }
+            if text.is_empty() || text.chars().count() > 1000 || !matches!(opt, "*" | "-") {
+                return Err(e("bad hotstring".into()));
+            }
+            Ok(Msg::Hotstring(id, Hotstring { immediate: opt == "*", trigger: trigger.to_owned(), text }))
+        }
         _ => Err(e(format!("unknown message {verb:?}"))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hotstring {
+    /// Fire as soon as the trigger is typed, instead of on the following space.
+    pub immediate: bool,
+    pub trigger: String,
+    pub text: String,
+}
+
+/// Rolling buffer of typed characters, only kept while hotstrings are loaded.
+#[derive(Default)]
+pub struct Hotstrings {
+    pub rules: Vec<(u32, Hotstring)>,
+    buf: String,
+}
+
+impl Hotstrings {
+    pub fn reset(&mut self) {
+        self.buf.clear();
+    }
+
+    pub fn backspace(&mut self) {
+        self.buf.pop();
+    }
+
+    /// Feed one typed character. On a match returns (rule index, characters to erase).
+    pub fn push(&mut self, c: char) -> Option<(usize, usize)> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        self.buf.push(c);
+        if self.buf.chars().count() > 64 {
+            let first = self.buf.chars().next().map_or(0, char::len_utf8);
+            self.buf.drain(..first);
+        }
+        let ended = c == ' ';
+        let body = if ended { &self.buf[..self.buf.len() - 1] } else { &self.buf[..] };
+        let hit = self.rules.iter().position(|(_, h)| {
+            h.immediate != ended && body.ends_with(&h.trigger) && {
+                // Word boundary before the trigger: start of buffer or a non-alphanumeric char.
+                let before = &body[..body.len() - h.trigger.len()];
+                before.chars().next_back().is_none_or(|p| !p.is_alphanumeric())
+            }
+        })?;
+        let erase = self.rules[hit].1.trigger.chars().count() + ended as usize;
+        self.buf.clear();
+        Some((hit, erase))
     }
 }
 
@@ -249,6 +343,11 @@ pub struct Matcher {
 }
 
 impl Matcher {
+    /// Modifiers currently held in the stream the matcher was fed.
+    pub fn mods(&self) -> u8 {
+        self.held.iter().fold(0, |a, k| a | mod_bit(*k))
+    }
+
     /// `value`: 1 press, 0 release, 2 autorepeat (evdev convention).
     pub fn key(&mut self, code: KeyCode, value: i32) -> Option<u32> {
         if mod_bit(code) != 0 {
@@ -262,7 +361,7 @@ impl Matcher {
         if value != 1 {
             return None;
         }
-        let mods = self.held.iter().fold(0, |a, k| a | mod_bit(*k));
+        let mods = self.mods();
         self.bindings.iter().find(|(_, c)| c.key == code && c.mods == mods).map(|(id, _)| *id)
     }
 }
@@ -377,5 +476,35 @@ mod tests {
         // Releasing physical keys afterwards emits nothing.
         assert_eq!(r.key(K::KEY_CAPSLOCK, 0, t), vec![]);
         assert_eq!(r.key(K::KEY_X, 0, t), vec![]);
+    }
+
+    #[test]
+    fn hotstrings() {
+        let hs = |line: &str| match parse_msg(line) {
+            Ok(Msg::Hotstring(id, h)) => (id, h),
+            other => panic!("{other:?}"),
+        };
+        let mut h = Hotstrings::default();
+        assert_eq!(h.push('x'), None, "no buffer without rules");
+        h.rules.push(hs("hotstring 0 - btw by the way"));
+        h.rules.push(hs(r"hotstring 1 * ;sig Best regards\nme"));
+        assert_eq!(h.rules[1].1.text, "Best regards\nme");
+        let typed = |h: &mut Hotstrings, s: &str| s.chars().filter_map(|c| h.push(c)).collect::<Vec<_>>();
+        assert_eq!(typed(&mut h, "so btw "), vec![(0, 4)]);
+        assert_eq!(typed(&mut h, "btw"), vec![], "waits for space");
+        assert_eq!(typed(&mut h, "xbtw "), vec![], "needs a word boundary");
+        h.reset();
+        assert_eq!(typed(&mut h, "bt"), vec![]);
+        h.backspace();
+        assert_eq!(typed(&mut h, "tw "), vec![(0, 4)], "backspace edits the buffer");
+        assert_eq!(typed(&mut h, "ok ;sig"), vec![(1, 4)], "immediate");
+        h.reset();
+        assert_eq!(typed(&mut h, "tw "), vec![], "reset forgets earlier chars");
+        assert!(parse_msg("hotstring 2 - ab x").is_err(), "trigger too short");
+        assert!(parse_msg("hotstring 2 ? abc x").is_err());
+        assert_eq!(
+            parse_msg("layout de nodeadkeys -"),
+            Ok(Msg::Layout("de".into(), "nodeadkeys".into(), String::new()))
+        );
     }
 }

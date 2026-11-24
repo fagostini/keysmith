@@ -8,7 +8,8 @@
 
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventSummary, EventType, InputEvent, KeyCode};
-use keysmith::{MAX_BINDINGS, Matcher, Msg, Remapper, SOCKET, is_output_key, parse_msg};
+use keysmith::xkb::{Decoder, Layout};
+use keysmith::{ALT, CTRL, Hotstrings, MAX_BINDINGS, Matcher, Msg, Remapper, SOCKET, SUPER, is_output_key, parse_msg};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -24,6 +25,8 @@ nix::ioctl_write_int!(eviocgrab, b'E', 0x90);
 
 enum Ev {
     Key(usize, KeyCode, i32),
+    /// A mouse button or touch: the text cursor may have moved.
+    Pointer,
     Lost(usize),
     Client(u64, UnixStream, u32),
     Msg(u64, Result<Msg, (u32, String)>),
@@ -51,6 +54,23 @@ fn spawn_devices(tx: &Sender<Ev>) -> Vec<Option<OwnedFd>> {
         let is_kbd = dev
             .supported_keys()
             .is_some_and(|k| k.contains(KeyCode::KEY_A) && k.contains(KeyCode::KEY_ENTER));
+        let is_pointer = dev
+            .supported_keys()
+            .is_some_and(|k| k.contains(KeyCode::BTN_LEFT) || k.contains(KeyCode::BTN_TOUCH));
+        if is_pointer && !is_kbd {
+            // Never grabbed; button presses only reset the hotstring buffer.
+            let tx = tx.clone();
+            thread::spawn(move || {
+                while let Ok(events) = dev.fetch_events() {
+                    for e in events {
+                        if matches!(e.destructure(), EventSummary::Key(_, _, 1)) {
+                            let _ = tx.send(Ev::Pointer);
+                        }
+                    }
+                }
+            });
+            continue;
+        }
         let Ok(fd) = dev.as_fd().try_clone_to_owned() else { continue };
         if !is_kbd {
             continue;
@@ -106,6 +126,12 @@ struct State {
     /// Physical keys down, per device. Grab only starts when this is empty,
     /// so the desktop never misses a release for a key it saw go down.
     pressed: HashSet<(usize, KeyCode)>,
+    hs: Hotstrings,
+    layout: Option<(Layout, Decoder)>,
+    /// Hotstring matched on this key's press; typed when it's released (rule index, chars to erase).
+    fire_on_release: Option<(KeyCode, usize, usize)>,
+    /// Hotstring id waiting for the engine to fill the clipboard.
+    pending_paste: Option<u32>,
 }
 
 impl State {
@@ -143,6 +169,76 @@ impl State {
         self.set_grab(false);
         self.r = Remapper::default();
         self.m.bindings.clear();
+        self.hs = Hotstrings::default();
+        self.fire_on_release = None;
+        self.pending_paste = None;
+    }
+
+    /// Emit synthetic keys: they reach the desktop and keep the decoder's
+    /// modifier state in sync, but never feed hotkeys or the hotstring buffer.
+    fn inject(&mut self, keys: &[(KeyCode, i32)]) {
+        // ponytail: one burst, no inter-key delay; add a 1 ms gap if an app drops keys.
+        for (k, v) in keys {
+            self.emit(&[(*k, *v)]);
+            if let Some((_, d)) = self.layout.as_mut() {
+                d.feed(*k, *v);
+            }
+        }
+    }
+
+    fn fire_hotstring(&mut self, idx: usize, erase: usize) {
+        let Some((layout, dec)) = self.layout.as_ref() else { return };
+        if self.m.mods() != 0 {
+            return; // user is holding a modifier; typing now would come out wrong
+        }
+        let (id, h) = &self.hs.rules[idx];
+        let ended = erase > h.trigger.chars().count();
+        let text = if ended { format!("{} ", h.text) } else { h.text.clone() };
+        let mut keys: Vec<_> = (0..erase).flat_map(|_| [(KeyCode::KEY_BACKSPACE, 1), (KeyCode::KEY_BACKSPACE, 0)]).collect();
+        match layout.type_keys(&text) {
+            Some(t) if dec.caps_lock() => {
+                let caps = [(KeyCode::KEY_CAPSLOCK, 1), (KeyCode::KEY_CAPSLOCK, 0)];
+                keys.extend(caps.iter().chain(&t).chain(&caps));
+            }
+            Some(t) => keys.extend(t),
+            None => {
+                // Not typable on this layout: the engine puts it on the clipboard, then we paste.
+                let id = *id;
+                self.inject(&keys);
+                self.pending_paste = Some(id);
+                self.reply(format!("paste {id}"));
+                return;
+            }
+        }
+        self.inject(&keys);
+    }
+
+    /// Every key event the desktop sees (post-remap when grabbed).
+    fn seen(&mut self, k: KeyCode, v: i32) {
+        self.hotkey(k, v);
+        let Some((_, dec)) = self.layout.as_mut() else { return };
+        let c = dec.feed(k, v);
+        if v == 0 && self.fire_on_release.is_some_and(|(fk, ..)| fk == k) {
+            let (_, idx, erase) = self.fire_on_release.take().unwrap();
+            self.fire_hotstring(idx, erase);
+            return;
+        }
+        if v != 1 || self.hs.rules.is_empty() {
+            return;
+        }
+        use KeyCode as K;
+        if self.m.mods() & (CTRL | ALT | SUPER) != 0 {
+            self.hs.reset();
+        } else if k == K::KEY_BACKSPACE {
+            self.hs.backspace();
+        } else if let Some(c) = c {
+            if let Some((idx, erase)) = self.hs.push(c) {
+                self.fire_on_release = Some((k, idx, erase));
+            }
+        } else if keysmith::mod_bit(k) == 0 {
+            // Enter, Tab, Esc, arrows, Home/End, Delete, F-keys...: cursor or context moved.
+            self.hs.reset();
+        }
     }
 
     fn reply(&mut self, line: String) {
@@ -172,6 +268,29 @@ impl State {
                 self.r.taphold = Duration::from_millis(ms);
                 None
             }
+            Ok(Msg::Layout(l, v, o)) => match Layout::new(&l, &v, &o) {
+                Ok(layout) => {
+                    eprintln!("layout {l} {v} {o}");
+                    let dec = layout.decoder();
+                    self.layout = Some((layout, dec));
+                    None
+                }
+                Err(e) => Some((0, e)),
+            },
+            Ok(Msg::Hotstring(id, _)) if rules + self.hs.rules.len() >= MAX_BINDINGS => Some((id, "too many rules".into())),
+            Ok(Msg::Hotstring(id, h)) => {
+                self.hs.rules.push((id, h));
+                None
+            }
+            Ok(Msg::Pasted(id)) => {
+                if self.pending_paste == Some(id) {
+                    self.pending_paste = None;
+                    let v = self.layout.as_ref().and_then(|(l, _)| l.key_for('v')).unwrap_or(KeyCode::KEY_V);
+                    // ponytail: always Ctrl+V; terminals want Ctrl+Shift+V once M5 knows the window class.
+                    self.inject(&[(KeyCode::KEY_LEFTCTRL, 1), (v, 1), (v, 0), (KeyCode::KEY_LEFTCTRL, 0)]);
+                }
+                None
+            }
         };
         if let Some((id, e)) = err {
             self.reply(format!("err {id} {e}"));
@@ -192,10 +311,10 @@ impl State {
             let out = self.r.key(k, v, Instant::now());
             self.emit(&out);
             for (k, v) in out {
-                self.hotkey(k, v);
+                self.seen(k, v);
             }
         } else {
-            self.hotkey(k, v);
+            self.seen(k, v);
             self.maybe_grab();
         }
     }
@@ -237,6 +356,10 @@ fn main() -> std::io::Result<()> {
         vdev,
         grabbed: false,
         pressed: HashSet::new(),
+        hs: Hotstrings::default(),
+        layout: None,
+        fire_on_release: None,
+        pending_paste: None,
     };
     loop {
         let ev = match s.r.deadline() {
@@ -248,11 +371,12 @@ fn main() -> std::io::Result<()> {
                 let out = s.r.tick(Instant::now());
                 s.emit(&out);
                 for (k, v) in out {
-                    s.hotkey(k, v);
+                    s.seen(k, v);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Ok(Ev::Key(dev, k, v)) => s.on_key(dev, k, v),
+            Ok(Ev::Pointer) => s.hs.reset(),
             Ok(Ev::Lost(dev)) => {
                 s.fds[dev] = None;
                 s.pressed.retain(|(d, _)| *d != dev);
