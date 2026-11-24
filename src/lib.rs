@@ -3,10 +3,11 @@
 //! Wire protocol: newline-delimited text over a Unix socket.
 //!   engine -> inputd: `bind <id> <combo>` | `remap <id> <key> <action>` | `taphold_ms <ms>`
 //!                     `layout <layout> <variant|-> <options|->`
-//!                     `hotstring <id> <*|-> <trigger> <replacement>` | `pasted <id>`
+//!                     `hotstring <id> <opts> <trigger> <replacement>` | `pasted <id>`
+//!                     `type <id> <text>`   (opts: `-`, `*` immediate, `f` callback)
 //!   inputd -> engine: `fired <id>` | `paste <id>` | `err <id> <reason>`
 //! Hotstrings are matched and typed inside inputd; the engine only hears about one
-//! when its text needs the clipboard (`paste`).
+//! when it has a script callback (`fired`) or its text needs the clipboard (`paste`).
 //! Raw key events never cross the socket; only match IDs do.
 // ponytail: text lines instead of bincode frames; switch when messages carry structured data.
 
@@ -124,9 +125,17 @@ pub enum Msg {
     Layout(String, String, String),
     Hotstring(u32, Hotstring),
     Pasted(u32),
+    Type(u32, String),
 }
 
+pub const MAX_TEXT: usize = 1000;
+
 pub const MIN_TRIGGER: usize = 3;
+
+/// Inverse of `unescape`, for putting arbitrary text on one wire line.
+pub fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t").replace('\r', "")
+}
 
 /// `\n`, `\t` and `\\` escapes in hotstring replacements.
 pub fn unescape(s: &str) -> String {
@@ -175,10 +184,19 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
             if trigger.chars().count() < MIN_TRIGGER {
                 return Err(e(format!("hotstring trigger needs at least {MIN_TRIGGER} characters")));
             }
-            if text.is_empty() || text.chars().count() > 1000 || !matches!(opt, "*" | "-") {
+            let callback = opt.contains('f');
+            let opts_ok = matches!(opt, "-" | "*" | "f" | "*f");
+            if !opts_ok || text.is_empty() != callback || text.chars().count() > MAX_TEXT {
                 return Err(e("bad hotstring".into()));
             }
-            Ok(Msg::Hotstring(id, Hotstring { immediate: opt == "*", trigger: trigger.to_owned(), text }))
+            Ok(Msg::Hotstring(id, Hotstring { immediate: opt.contains('*'), callback, trigger: trigger.to_owned(), text }))
+        }
+        "type" => {
+            let text = unescape(rest);
+            if text.is_empty() || text.chars().count() > MAX_TEXT {
+                return Err(e(format!("send() text must be 1..={MAX_TEXT} characters")));
+            }
+            Ok(Msg::Type(id, text))
         }
         _ => Err(e(format!("unknown message {verb:?}"))),
     }
@@ -188,6 +206,8 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
 pub struct Hotstring {
     /// Fire as soon as the trigger is typed, instead of on the following space.
     pub immediate: bool,
+    /// Erase the trigger and tell the engine (`fired`) instead of typing `text`.
+    pub callback: bool,
     pub trigger: String,
     pub text: String,
 }
@@ -502,6 +522,13 @@ mod tests {
         assert_eq!(typed(&mut h, "tw "), vec![], "reset forgets earlier chars");
         assert!(parse_msg("hotstring 2 - ab x").is_err(), "trigger too short");
         assert!(parse_msg("hotstring 2 ? abc x").is_err());
+        assert!(hs("hotstring 3 *f abc").1.callback);
+        assert!(parse_msg("hotstring 3 f abc text").is_err(), "callback takes no text");
+        assert!(parse_msg("hotstring 3 - abc").is_err(), "text needed");
+        let tricky = "a\\n b\nc\td";
+        assert_eq!(unescape(&escape(tricky)), tricky);
+        assert_eq!(parse_msg(&format!("type 9 {}", escape("x\ny"))), Ok(Msg::Type(9, "x\ny".into())));
+        assert!(parse_msg("type 9 ").is_err());
         assert_eq!(
             parse_msg("layout de nodeadkeys -"),
             Ok(Msg::Layout("de".into(), "nodeadkeys".into(), String::new()))

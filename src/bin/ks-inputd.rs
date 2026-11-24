@@ -11,7 +11,7 @@ use evdev::{AttributeSet, EventSummary, EventType, InputEvent, KeyCode};
 use keysmith::xkb::{Decoder, Layout};
 use keysmith::{ALT, CTRL, Hotstrings, MAX_BINDINGS, Matcher, Msg, Remapper, SOCKET, SUPER, is_output_key, parse_msg};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -132,6 +132,9 @@ struct State {
     fire_on_release: Option<(KeyCode, usize, usize)>,
     /// Hotstring id waiting for the engine to fill the clipboard.
     pending_paste: Option<u32>,
+    /// `send()` text from scripts, typed once no modifier is held (a hotkey's own
+    /// ctrl/alt would otherwise turn "hi" into ctrl+alt+h ctrl+alt+i).
+    queued: VecDeque<(u32, String, Instant)>,
 }
 
 impl State {
@@ -172,6 +175,19 @@ impl State {
         self.hs = Hotstrings::default();
         self.fire_on_release = None;
         self.pending_paste = None;
+        self.queued.clear();
+    }
+
+    /// Type queued `send()` text if the user isn't holding a modifier.
+    fn flush_queue(&mut self) {
+        while self.m.mods() == 0 {
+            let Some((id, text, at)) = self.queued.pop_front() else { return };
+            if at.elapsed() > Duration::from_secs(2) {
+                self.reply(format!("err {id} send() dropped: modifiers held for over 2 s"));
+            } else {
+                self.type_text(id, &text, 0);
+            }
+        }
     }
 
     /// Emit synthetic keys: they reach the desktop and keep the decoder's
@@ -187,15 +203,29 @@ impl State {
     }
 
     fn fire_hotstring(&mut self, idx: usize, erase: usize) {
-        let Some((layout, dec)) = self.layout.as_ref() else { return };
         if self.m.mods() != 0 {
             return; // user is holding a modifier; typing now would come out wrong
         }
         let (id, h) = &self.hs.rules[idx];
-        let ended = erase > h.trigger.chars().count();
+        let (id, ended) = (*id, erase > h.trigger.chars().count());
+        if h.callback {
+            let keys: Vec<_> = (0..erase).flat_map(|_| [(KeyCode::KEY_BACKSPACE, 1), (KeyCode::KEY_BACKSPACE, 0)]).collect();
+            self.inject(&keys);
+            self.reply(format!("fired {id}"));
+            return;
+        }
         let text = if ended { format!("{} ", h.text) } else { h.text.clone() };
+        self.type_text(id, &text, erase);
+    }
+
+    /// Erase `erase` characters, then type `text` (or ask the engine to paste it).
+    fn type_text(&mut self, id: u32, text: &str, erase: usize) {
+        let Some((layout, dec)) = self.layout.as_ref() else {
+            self.reply(format!("err {id} no keyboard layout set"));
+            return;
+        };
         let mut keys: Vec<_> = (0..erase).flat_map(|_| [(KeyCode::KEY_BACKSPACE, 1), (KeyCode::KEY_BACKSPACE, 0)]).collect();
-        match layout.type_keys(&text) {
+        match layout.type_keys(text) {
             Some(t) if dec.caps_lock() => {
                 let caps = [(KeyCode::KEY_CAPSLOCK, 1), (KeyCode::KEY_CAPSLOCK, 0)];
                 keys.extend(caps.iter().chain(&t).chain(&caps));
@@ -203,7 +233,6 @@ impl State {
             Some(t) => keys.extend(t),
             None => {
                 // Not typable on this layout: the engine puts it on the clipboard, then we paste.
-                let id = *id;
                 self.inject(&keys);
                 self.pending_paste = Some(id);
                 self.reply(format!("paste {id}"));
@@ -282,6 +311,11 @@ impl State {
                 self.hs.rules.push((id, h));
                 None
             }
+            Ok(Msg::Type(id, text)) => {
+                self.queued.push_back((id, text, Instant::now()));
+                self.flush_queue();
+                None
+            }
             Ok(Msg::Pasted(id)) => {
                 if self.pending_paste == Some(id) {
                     self.pending_paste = None;
@@ -316,6 +350,9 @@ impl State {
         } else {
             self.seen(k, v);
             self.maybe_grab();
+        }
+        if !self.queued.is_empty() {
+            self.flush_queue();
         }
     }
 
@@ -360,6 +397,7 @@ fn main() -> std::io::Result<()> {
         layout: None,
         fire_on_release: None,
         pending_paste: None,
+        queued: VecDeque::new(),
     };
     loop {
         let ev = match s.r.deadline() {
