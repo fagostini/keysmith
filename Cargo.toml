@@ -8,4 +8,12 @@ license = "GPL-3.0-or-later"
 # when the engine grows deps (zbus, mlua) that inputd must not link.
 [dependencies]
 evdev = "0.13"
-nix = { version = "0.29", features = ["socket"] }
+nix = { version = "0.29", features = ["socket", "ioctl"] }
+
+# A panic anywhere must kill the process, so the kernel drops the grab and
+# the virtual keyboard (releasing its keys) instead of leaving a half-dead broker.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

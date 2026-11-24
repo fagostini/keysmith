@@ -1,12 +1,15 @@
-//! User-session engine (M1): reads `~/.config/keysmith/hotkeys.conf`,
-//! registers the combos with inputd and runs the command when one fires.
-// ponytail: plain `combo = command` config until the Luau API lands in M4.
+//! User-session engine: reads `~/.config/keysmith/hotkeys.conf`, sends the
+//! rules to inputd and runs the command when a hotkey fires.
+// ponytail: plain `lhs = rhs` config until the Luau API lands in M4.
 
-use keysmith::{Combo, SOCKET};
+use keysmith::{SOCKET, parse_msg};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+
+/// One config entry: (config line number, wire message, command if it's a hotkey).
+type Rule = (usize, String, Option<String>);
 
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -15,27 +18,34 @@ fn config_path() -> PathBuf {
         .join("keysmith/hotkeys.conf")
 }
 
-fn load(path: &PathBuf) -> Result<Vec<(String, String)>, String> {
+fn load(path: &PathBuf) -> Result<Vec<Rule>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
+    for (n, line) in (1..).zip(text.lines()) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (combo, cmd) = line.split_once('=').ok_or(format!("line {}: expected `combo = command`", n + 1))?;
+        let (lhs, rhs) = line.split_once('=').ok_or(format!("line {n}: expected `lhs = rhs`"))?;
+        let (lhs, rhs, id) = (lhs.trim(), rhs.trim(), out.len());
+        let (wire, cmd) = if lhs == "taphold_ms" {
+            (format!("taphold_ms {rhs}"), None)
+        } else if let Some(src) = lhs.strip_prefix("remap ") {
+            (format!("remap {id} {} {rhs}", src.trim()), None)
+        } else {
+            (format!("bind {id} {lhs}"), Some(rhs.to_owned()))
+        };
         // Validate here for line numbers; inputd re-parses and has the final say.
-        let combo = combo.trim();
-        combo.parse::<Combo>().map_err(|e| format!("line {}: {e}", n + 1))?;
-        out.push((combo.to_owned(), cmd.trim().to_owned()));
+        parse_msg(&wire).map_err(|(_, e)| format!("line {n}: {e}"))?;
+        out.push((n, wire, cmd));
     }
     Ok(out)
 }
 
 fn main() -> ExitCode {
     let path = std::env::args_os().nth(1).map(PathBuf::from).unwrap_or_else(config_path);
-    let hotkeys = match load(&path) {
-        Ok(h) => h,
+    let rules = match load(&path) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("keysmith: {e}");
             return ExitCode::FAILURE;
@@ -48,24 +58,23 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for (id, (combo, _)) in hotkeys.iter().enumerate() {
-        if writeln!(sock, "bind {id} {combo}").is_err() {
+    for (_, wire, _) in &rules {
+        if writeln!(sock, "{wire}").is_err() {
             return ExitCode::FAILURE;
         }
     }
-    eprintln!("keysmith: {} hotkeys from {}", hotkeys.len(), path.display());
+    eprintln!("keysmith: {} rules from {}", rules.len(), path.display());
 
     for line in BufReader::new(sock).lines().map_while(Result::ok) {
         let mut parts = line.splitn(3, ' ');
-        match (parts.next(), parts.next().and_then(|i| i.parse::<usize>().ok())) {
-            (Some("fired"), Some(id)) if id < hotkeys.len() => {
-                let cmd = &hotkeys[id].1;
-                match Command::new("sh").arg("-c").arg(cmd).spawn() {
-                    Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
-                    Err(e) => eprintln!("keysmith: {cmd}: {e}"),
-                }
-            }
-            (Some("err"), _) => eprintln!("keysmith: inputd: {line}"),
+        let (verb, id, rest) = (parts.next(), parts.next().and_then(|i| i.parse::<usize>().ok()), parts.next());
+        match (verb, id.and_then(|i| rules.get(i))) {
+            (Some("fired"), Some((_, _, Some(cmd)))) => match Command::new("sh").arg("-c").arg(cmd).spawn() {
+                Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+                Err(e) => eprintln!("keysmith: {cmd}: {e}"),
+            },
+            (Some("err"), Some((n, ..))) => eprintln!("keysmith: line {n}: {}", rest.unwrap_or("")),
+            (Some("err"), None) => eprintln!("keysmith: inputd: {}", rest.unwrap_or("")),
             _ => eprintln!("keysmith: unexpected {line:?}"),
         }
     }
