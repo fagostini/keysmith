@@ -19,7 +19,7 @@ hotkey("super+f9", function()
 end)
 ```
 
-> **Status: early (0.1).** Tested on X11 (Cinnamon). The Wayland window
+> **Status: early (0.2).** Tested on X11 (Cinnamon). The Wayland window
 > backends (GNOME, KDE Plasma 6, Sway, Hyprland, other wlroots compositors)
 > are implemented but not yet verified on real sessions.
 
