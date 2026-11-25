@@ -1,6 +1,6 @@
 # Maintainer: Federico Agostini <1116545+fagostini@users.noreply.github.com>
 pkgname=keysmith
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Hotkeys, key remaps, text expansion and Luau scripts for Wayland and X11'
 arch=('x86_64' 'aarch64')
@@ -17,7 +17,7 @@ optdepends=('xclip: paste characters your layout cannot type (X11)'
             'libnotify: error notifications')
 install=keysmith.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('697e79101bad8f8f4e323d99b73f9d13f9e0ced2f1c9bfec0ae3396c2b0a2904')
+sha256sums=('1ca2683ded697f24a74f5ff07fac9aa75d5371b8be9382ed396de898fe20e60c')
 
 prepare() {
   cd "$pkgname-$pkgver"
