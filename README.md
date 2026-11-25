@@ -103,6 +103,7 @@ Key names are evdev names without `KEY_`: `a`, `f5`, `enter`, `leftctrl`,
 | `remap(key, "key")` / `remap(key, {tap=…, hold=…})` | Remap a key. |
 | `hotstring(trigger, "text" \| fn, {immediate=true})` | Text expansion, or call `fn` (the trigger is erased). |
 | `send(text)` | Type text, on any layout. Characters your layout lacks go through the clipboard (needs `xclip` or `wl-clipboard`). |
+| `key(combo)` | Press a key or shortcut: `key("ctrl+s")`, `key("enter")`, `key("volumeup")`. |
 | `run(cmd)` | Run a shell command. Needs `--! capabilities: run` in the script header and your approval. |
 | `sleep(ms)`, `notify(msg)`, `print(…)` | |
 | `window.class`, `window.title` | The focused window (X11 class or Wayland app id). |
@@ -112,6 +113,36 @@ Errors appear in the manager's Log tab and as notifications.
 
 Approve a script that needs capabilities in the manager (**Allow…**) or with
 `keysmith trust ~/.config/keysmith/scripts/NAME.luau`.
+
+### Recording macros
+
+Press **Ctrl+Alt+Shift+R**, type, and press it again. Keysmith saves what you
+typed as `scripts/recorded-<time>.luau`, **disabled**, bound to
+`ctrl+alt+shift+p`: edit the hotkey, then enable it in the manager.
+
+This is the one time key events leave `ks-inputd`, so the session is tightly
+limited:
+- Only a physical key press starts it. No program can start it for you.
+- The tray icon turns into a record icon while it runs.
+- It stops at the latest after 60 s, after 2000 keys, or when you switch apps.
+
+Don't record passwords: the script stores what you typed in plain text.
+
+### Converting AutoHotkey scripts
+
+```sh
+keysmith convert my.ahk > ~/.config/keysmith/scripts/my.luau
+```
+
+Handles both v1 and v2 syntax:
+- hotkeys, remaps and hotstrings;
+- `Send` (with `{Keys}` and `^!+#`), `SendText`, `Sleep`, `Run`, `MsgBox`;
+- `#HotIf WinActive(...)`, `#IfWinActive` and `if WinActive(...)`.
+
+Anything else becomes a `-- TODO(ahk):` line to finish by hand.
+Windows program names (`ahk_exe firefox.exe`) become a window class check.
+Confirm the real class with `keysmith windows`.
+[`examples/ahk/top20.ahk`](examples/ahk/top20.ahk) shows what converts.
 
 ### Manager
 

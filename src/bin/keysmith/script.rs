@@ -24,8 +24,9 @@ pub enum Reg {
     Hotstring { trigger: String, immediate: bool, text: Option<String>, cb: Option<usize> },
 }
 
-/// `send(text)` implementation provided by the engine: (script name, text).
-pub type SendFn = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+/// Output to inputd, provided by the engine: (script name, verb, argument);
+/// verb `type` for `send(text)`, `key` for `key(combo)`.
+pub type SendFn = Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>;
 
 pub struct Loaded {
     pub regs: Vec<Reg>,
@@ -133,10 +134,15 @@ fn setup(
         })?,
     )?;
 
-    let n = name.to_owned();
+    let (n, sf) = (name.to_owned(), send.clone());
     g.set(
         "send",
-        lua.create_function(move |_, text: String| send(&n, &text).map_err(mlua::Error::runtime))?,
+        lua.create_function(move |_, text: String| sf(&n, "type", &text).map_err(mlua::Error::runtime))?,
+    )?;
+    let n = name.to_owned();
+    g.set(
+        "key",
+        lua.create_function(move |_, combo: String| send(&n, "key", &combo).map_err(mlua::Error::runtime))?,
     )?;
     g.set(
         "run",
@@ -234,7 +240,7 @@ mod tests {
     }
 
     fn load(src: &str) -> Result<Loaded, String> {
-        spawn("t.luau".into(), src.into(), Arc::new(|_, _| Ok(())))
+        spawn("t.luau".into(), src.into(), Arc::new(|_, _, _| Ok(())))
     }
 
     #[test]
@@ -266,15 +272,15 @@ mod tests {
     fn callbacks_run_and_send() {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
-        let send: SendFn = Arc::new(move |n, t| {
-            g.lock().unwrap().push(format!("{n}:{t}"));
+        let send: SendFn = Arc::new(move |n, v, t| {
+            g.lock().unwrap().push(format!("{n}:{v}:{t}"));
             Ok(())
         });
-        let l = spawn("s.luau".into(), r#"local n = 0 hotkey("f5", function() n += 1 send("hi " .. n) end)"#.into(), send).unwrap();
+        let l = spawn("s.luau".into(), r#"local n = 0 hotkey("f5", function() n += 1 send("hi " .. n) key("ctrl+s") end)"#.into(), send).unwrap();
         l.tx.send(0).unwrap();
         l.tx.send(0).unwrap();
         thread::sleep(Duration::from_millis(200));
-        assert_eq!(*got.lock().unwrap(), vec!["s.luau:hi 1", "s.luau:hi 2"]);
+        assert_eq!(*got.lock().unwrap(), vec!["s.luau:type:hi 1", "s.luau:key:ctrl+s", "s.luau:type:hi 2", "s.luau:key:ctrl+s"]);
     }
 
     #[test]
@@ -297,7 +303,7 @@ mod tests {
     fn window_is_live() {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
-        let send: SendFn = Arc::new(move |_, t| {
+        let send: SendFn = Arc::new(move |_, _, t| {
             g.lock().unwrap().push(t.to_owned());
             Ok(())
         });
@@ -316,7 +322,7 @@ mod tests {
     fn late_registration_rejected() {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
-        let send: SendFn = Arc::new(move |_, t| {
+        let send: SendFn = Arc::new(move |_, _, t| {
             g.lock().unwrap().push(t.to_owned());
             Ok(())
         });

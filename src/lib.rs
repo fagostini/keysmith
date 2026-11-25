@@ -4,8 +4,13 @@
 //!   engine -> inputd: `bind <id> <combo>` | `remap <id> <key> <action>` | `taphold_ms <ms>`
 //!                     `layout <layout> <variant|-> <options|->`
 //!                     `hotstring <id> <opts> <trigger> <replacement>` | `pasted <id>`
-//!                     `type <id> <text>` | `focus` (window changed; no details)   (opts: `-`, `*` immediate, `f` callback)
+//!                     `type <id> <text>` | `key <id> <combo>` | `focus` (window changed; no details)
+//!                     `record stop`   (hotstring opts: `-`, `*` immediate, `f` callback)
 //!   inputd -> engine: `fired <id>` | `paste <id>` | `err <id> <reason>`
+//!                     `rec start` | `rec <code> <value> <ms>` | `rec stop <reason>`
+//! The one exception to "no raw keys": the macro recorder. Only a physical
+//! Ctrl+Alt+Shift+R starts it (nothing on the socket can), and inputd ends it
+//! after RECORD_SECS / RECORD_MAX keys at the latest.
 //! Hotstrings are matched and typed inside inputd; the engine only hears about one
 //! when it has a script callback (`fired`) or its text needs the clipboard (`paste`).
 //! Raw key events never cross the socket; only match IDs do.
@@ -19,6 +24,8 @@ use std::time::{Duration, Instant};
 
 pub const SOCKET: &str = "/run/keysmith/inputd.sock";
 pub const MAX_BINDINGS: usize = 256;
+pub const RECORD_SECS: u64 = 60;
+pub const RECORD_MAX: usize = 2000;
 
 pub const CTRL: u8 = 1;
 pub const ALT: u8 = 2;
@@ -127,7 +134,10 @@ pub enum Msg {
     /// Clipboard is ready; `true` = paste with Ctrl+Shift+V (terminal).
     Pasted(u32, bool),
     Type(u32, String),
+    /// Tap a combo through the virtual keyboard (`key("ctrl+s")`).
+    Key(u32, Combo),
     Focus,
+    RecordStop,
 }
 
 pub const MAX_TEXT: usize = 1000;
@@ -170,6 +180,9 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
     if verb == "focus" {
         return Ok(Msg::Focus);
     }
+    if line == "record stop" {
+        return Ok(Msg::RecordStop);
+    }
     if verb == "layout" {
         let mut w = line.split(' ').skip(1).map(|s| if s == "-" { "" } else { s }.to_owned());
         return Ok(Msg::Layout(w.next().unwrap_or_default(), w.next().unwrap_or_default(), w.next().unwrap_or_default()));
@@ -202,6 +215,13 @@ pub fn parse_msg(line: &str) -> Result<Msg, (u32, String)> {
                 return Err(e(format!("send() text must be 1..={MAX_TEXT} characters")));
             }
             Ok(Msg::Type(id, text))
+        }
+        "key" => {
+            let c: Combo = rest.parse().map_err(e)?;
+            if mod_bit(c.key) != 0 || !is_output_key(c.key) {
+                return Err(e(format!("key(): {rest:?} is not a key to tap")));
+            }
+            Ok(Msg::Key(id, c))
         }
         _ => Err(e(format!("unknown message {verb:?}"))),
     }
@@ -391,10 +411,39 @@ impl Matcher {
     }
 }
 
+/// evdev name without `KEY_`, lowercase: the spelling combos use (`leftctrl`, `f5`).
+pub fn key_name(k: KeyCode) -> String {
+    let n = format!("{k:?}");
+    n.strip_prefix("KEY_").unwrap_or(&n).to_ascii_lowercase()
+}
+
+impl std::fmt::Display for Combo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for (bit, name) in [(CTRL, "ctrl+"), (ALT, "alt+"), (SHIFT, "shift+"), (SUPER, "super+")] {
+            if self.mods & bit != 0 {
+                f.write_str(name)?;
+            }
+        }
+        f.write_str(&key_name(self.key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use KeyCode as K;
+
+    #[test]
+    fn key_msg_and_display() {
+        let c = Combo { mods: CTRL | SHIFT, key: K::KEY_S };
+        assert_eq!(c.to_string(), "ctrl+shift+s");
+        assert_eq!(parse_msg("key 7 ctrl+shift+s"), Ok(Msg::Key(7, c)));
+        assert_eq!(parse_msg("key 7 enter"), Ok(Msg::Key(7, Combo { mods: 0, key: K::KEY_ENTER })));
+        assert!(parse_msg("key 7 ctrl+leftshift").is_err());
+        assert!(parse_msg("key 7 ctrl+btn_left").is_err());
+        assert_eq!(parse_msg("record stop"), Ok(Msg::RecordStop));
+        assert!(parse_msg("record start").is_err());
+    }
 
     #[test]
     fn parse_combo() {

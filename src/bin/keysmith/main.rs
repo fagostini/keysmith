@@ -4,10 +4,13 @@
 //!   keysmith [CONFIG]        run (default ~/.config/keysmith/hotkeys.conf)
 //!   keysmith trust SCRIPT    approve a script's declared capabilities
 //!   keysmith windows         print focus changes (tests the window backend)
+//!   keysmith convert FILE    convert an AutoHotkey script to Luau (stdout)
 //!
 //! SIGHUP reloads (re-execs). State for the manager UI lives in `run_dir()`:
 //! `status.json` (per-script state), `engine.log`, `pid`.
 
+mod ahk;
+mod record;
 mod script;
 mod window;
 
@@ -252,6 +255,26 @@ fn load_scripts(
     scripts
 }
 
+/// Saves a finished recording as a disabled script; returns its path.
+fn save_recording(dir: &Path, events: &[(u16, i32, u64)], layout: &str) -> Result<PathBuf, String> {
+    let layout = match parse_msg(layout) {
+        Ok(keysmith::Msg::Layout(l, v, o)) => keysmith::xkb::Layout::new(&l, &v, &o).ok(),
+        _ => None,
+    };
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let name = format!("recorded-{secs}.luau");
+    let header = "-- Recorded with Ctrl+Alt+Shift+R. Change the hotkey below if you like,\n\
+                  -- then enable this script in the manager (it starts disabled).";
+    let lua = record::to_luau(events, layout.as_ref(), header);
+    let scripts = dir.join("scripts");
+    std::fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
+    let mut off = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("disabled")).map_err(|e| e.to_string())?;
+    writeln!(off, "{name}").map_err(|e| e.to_string())?;
+    let path = scripts.join(name);
+    std::fs::write(&path, lua).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Recently `send()`-ed texts by request id, for `paste` and `err` replies.
 type Sent = Mutex<VecDeque<(u32, String, String)>>;
 
@@ -295,6 +318,26 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().is_some_and(|a| a == "convert") {
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: keysmith convert <script.ahk>");
+            return ExitCode::FAILURE;
+        };
+        return match std::fs::read(path) {
+            Ok(src) => {
+                let (lua, todo) = ahk::convert(&String::from_utf8_lossy(&src));
+                print!("{lua}");
+                if todo > 0 {
+                    eprintln!("keysmith: {todo} line(s) need manual work: search for TODO(ahk)");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("keysmith: {}: {e}", path.display());
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().is_some_and(|a| a == "windows") {
         let name = window::start(Arc::new(|w: Window| println!("{:?}  {:?}", w.class, w.title)));
         return match name {
@@ -318,6 +361,9 @@ fn main() -> ExitCode {
     let _ = std::fs::create_dir_all(&rd);
     let _ = std::fs::write(rd.join("engine.log"), "");
     let _ = std::fs::write(rd.join("pid"), std::process::id().to_string());
+    // Exists while a recording runs; the tray shows it.
+    let rec_flag = rd.join("recording");
+    let _ = std::fs::remove_file(&rec_flag);
 
     // Engine-side override for testing against a fake inputd; inputd's path is fixed.
     let socket = std::env::var("KEYSMITH_SOCKET").unwrap_or_else(|_| SOCKET.into());
@@ -341,14 +387,14 @@ fn main() -> ExitCode {
     let next_id = Arc::new(AtomicU32::new(1 << 24));
     let send: SendFn = {
         let (w, sent) = (writer.clone(), sent.clone());
-        Arc::new(move |origin: &str, text: &str| {
+        Arc::new(move |origin: &str, verb: &str, text: &str| {
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             let mut s = sent.lock().unwrap();
             s.push_back((id, origin.to_owned(), text.to_owned()));
             if s.len() > 64 {
                 s.pop_front();
             }
-            writeln!(w.lock().unwrap(), "type {id} {}", escape(text)).map_err(|e| e.to_string())
+            writeln!(w.lock().unwrap(), "{verb} {id} {}", escape(text)).map_err(|e| e.to_string())
         })
     };
 
@@ -374,12 +420,18 @@ fn main() -> ExitCode {
             }
         }
     }
+    // App class the recording started in; switching apps ends it.
+    let rec_class: Arc<Mutex<Option<String>>> = Arc::default();
     let backend = {
-        let (w, win) = (writer.clone(), win.clone());
+        let (w, win, rc) = (writer.clone(), win.clone(), rec_class.clone());
         window::start(Arc::new(move |now: Window| {
+            let mut w = w.lock().unwrap();
+            if rc.lock().unwrap().as_ref().is_some_and(|c| *c != now.class) {
+                let _ = writeln!(w, "record stop");
+            }
             *win.lock().unwrap() = now;
             // inputd only learns *that* focus changed (to reset the hotstring buffer).
-            let _ = writeln!(w.lock().unwrap(), "focus");
+            let _ = writeln!(w, "focus");
         }))
     };
     let backend = backend.unwrap_or_else(|e| {
@@ -388,7 +440,38 @@ fn main() -> ExitCode {
     });
     log(&format!("{} rules, {} scripts, {layout}, window backend {backend}", rules.len(), scripts.len()));
 
+    let mut recording: Option<Vec<(u16, i32, u64)>> = None;
     for line in BufReader::new(sock).lines().map_while(Result::ok) {
+        if let Some(rec) = line.strip_prefix("rec ") {
+            match rec.split_once(' ').unwrap_or((rec, "")) {
+                ("start", _) => {
+                    recording = Some(Vec::new());
+                    *rec_class.lock().unwrap() = Some(win.lock().unwrap().class.clone());
+                    let _ = std::fs::write(&rec_flag, "");
+                    report("recorder", &format!("recording keys; Ctrl+Alt+Shift+R stops (at most {} s)", keysmith::RECORD_SECS));
+                }
+                ("stop", why) => {
+                    *rec_class.lock().unwrap() = None;
+                    let _ = std::fs::remove_file(&rec_flag);
+                    let events = recording.take().unwrap_or_default();
+                    if !events.iter().any(|e| e.1 == 1 && keysmith::mod_bit(evdev::KeyCode::new(e.0)) == 0) {
+                        report("recorder", &format!("{why}; nothing recorded"));
+                    } else {
+                        match save_recording(&dir, &events, &layout) {
+                            Ok(p) => report("recorder", &format!("{why}; saved {} (disabled)", p.display())),
+                            Err(e) => report("recorder", &e),
+                        }
+                    }
+                }
+                (code, rest) => {
+                    let mut f = rest.split(' ').filter_map(|x| x.parse::<u64>().ok());
+                    if let (Some(rec), Ok(code), Some(v), Some(ms)) = (recording.as_mut(), code.parse(), f.next(), f.next()) {
+                        rec.push((code, v as i32, ms));
+                    }
+                }
+            }
+            continue;
+        }
         let mut parts = line.splitn(3, ' ');
         let (verb, id, rest) = (parts.next(), parts.next().and_then(|i| i.parse::<u32>().ok()), parts.next().unwrap_or(""));
         let rule = id.and_then(|i| rules.get(i as usize));
@@ -446,7 +529,7 @@ mod tests {
     #[test]
     fn example_scripts() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
-        let send: SendFn = Arc::new(|_, _| Ok(()));
+        let send: SendFn = Arc::new(|_, _, _| Ok(()));
         let win = Arc::new(Mutex::new(Window::default()));
         let mut rules = Vec::new();
         let mut n = 0;

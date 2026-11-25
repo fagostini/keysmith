@@ -56,17 +56,18 @@ enum TrayCmd {
     Quit,
 }
 
-struct Tray(mpsc::Sender<TrayCmd>);
+/// (commands to the UI, a recording is running)
+struct Tray(mpsc::Sender<TrayCmd>, bool);
 
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
         "keysmith".into()
     }
     fn title(&self) -> String {
-        "Keysmith".into()
+        if self.1 { "Keysmith: recording keys (Ctrl+Alt+Shift+R stops)" } else { "Keysmith" }.into()
     }
     fn icon_name(&self) -> String {
-        "input-keyboard".into()
+        if self.1 { "media-record" } else { "input-keyboard" }.into()
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         let _ = self.0.send(TrayCmd::Open);
@@ -317,7 +318,8 @@ fn main() -> glib::ExitCode {
         std::mem::forget(app.hold());
         let (tx, rx) = mpsc::channel();
         use ksni::blocking::TrayMethods;
-        if let Err(e) = Tray(tx).spawn() {
+        let tray = Tray(tx, false).spawn();
+        if let Err(e) = &tray {
             eprintln!("ks-ui: no tray icon ({e}); closing the window quits");
             u.window.set_hide_on_close(false);
             let app = app.clone();
@@ -327,7 +329,14 @@ fn main() -> glib::ExitCode {
             });
         }
         let (u2, app2) = (u.clone(), app.clone());
+        let rec_flag = run_dir().join("recording");
         glib::timeout_add_local(Duration::from_millis(100), move || {
+            if let Ok(t) = &tray {
+                let rec = rec_flag.exists();
+                if t.update(|t| std::mem::replace(&mut t.1, rec)) != Some(rec) {
+                    u2.refresh();
+                }
+            }
             for cmd in rx.try_iter() {
                 match cmd {
                     TrayCmd::Open => u2.window.present(),

@@ -61,6 +61,7 @@ assets = [
     ["data/gnome-extension/keysmith@fagostini.github.io/*", "usr/share/gnome-shell/extensions/keysmith@fagostini.github.io/", "644"],
     ["examples/hotkeys.conf", "usr/share/doc/keysmith/examples/", "644"],
     ["examples/scripts/*", "usr/share/doc/keysmith/examples/scripts/", "644"],
+    ["examples/ahk/*", "usr/share/doc/keysmith/examples/ahk/", "644"],
     ["README.md", "usr/share/doc/keysmith/", "644"],
 ]
 conf-files = []
@@ -85,6 +86,7 @@ assets = [
     { source = "data/gnome-extension/keysmith@fagostini.github.io/*", dest = "/usr/share/gnome-shell/extensions/keysmith@fagostini.github.io/", mode = "644" },
     { source = "examples/hotkeys.conf", dest = "/usr/share/doc/keysmith/examples/hotkeys.conf", mode = "644", doc = true },
     { source = "examples/scripts/*", dest = "/usr/share/doc/keysmith/examples/scripts/", mode = "644", doc = true },
+    { source = "examples/ahk/*", dest = "/usr/share/doc/keysmith/examples/ahk/", mode = "644", doc = true },
     { source = "README.md", dest = "/usr/share/doc/keysmith/README.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/keysmith/LICENSE", mode = "644" },
 ]

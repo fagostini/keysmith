@@ -47,5 +47,6 @@ package() {
   install -Dm644 -t "$pkgdir/usr/share/gnome-shell/extensions/$ext" data/gnome-extension/$ext/*
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples" examples/hotkeys.conf README.md
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples/scripts" examples/scripts/*
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/examples/ahk" examples/ahk/*
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

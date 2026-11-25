@@ -9,7 +9,10 @@
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventSummary, EventType, InputEvent, KeyCode};
 use keysmith::xkb::{Decoder, Layout};
-use keysmith::{ALT, CTRL, Hotstrings, MAX_BINDINGS, Matcher, Msg, Remapper, SOCKET, SUPER, is_output_key, parse_msg};
+use keysmith::{
+    ALT, CTRL, Combo, Hotstrings, MAX_BINDINGS, Matcher, Msg, RECORD_MAX, RECORD_SECS, Remapper, SHIFT, SOCKET, SUPER, is_output_key,
+    parse_msg,
+};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -116,6 +119,20 @@ fn serve(listener: UnixListener, tx: Sender<Ev>) {
     }
 }
 
+/// Queued output from scripts.
+enum Out {
+    Text(String),
+    Keys(Combo),
+}
+
+/// A recording session: the only time key events leave inputd.
+struct Rec {
+    start: Instant,
+    /// Presses recorded, so releases of keys held before the start are skipped.
+    down: HashSet<KeyCode>,
+    n: usize,
+}
+
 struct State {
     m: Matcher,
     r: Remapper,
@@ -134,7 +151,8 @@ struct State {
     pending_paste: Option<u32>,
     /// `send()` text from scripts, typed once no modifier is held (a hotkey's own
     /// ctrl/alt would otherwise turn "hi" into ctrl+alt+h ctrl+alt+i).
-    queued: VecDeque<(u32, String, Instant)>,
+    queued: VecDeque<(u32, Out, Instant)>,
+    rec: Option<Rec>,
 }
 
 impl State {
@@ -176,16 +194,19 @@ impl State {
         self.fire_on_release = None;
         self.pending_paste = None;
         self.queued.clear();
+        self.rec = None;
     }
 
     /// Type queued `send()` text if the user isn't holding a modifier.
     fn flush_queue(&mut self) {
         while self.m.mods() == 0 {
-            let Some((id, text, at)) = self.queued.pop_front() else { return };
-            if at.elapsed() > Duration::from_secs(2) {
-                self.reply(format!("err {id} send() dropped: modifiers held for over 2 s"));
-            } else {
-                self.type_text(id, &text, 0);
+            let Some((id, out, at)) = self.queued.pop_front() else { return };
+            match out {
+                _ if at.elapsed() > Duration::from_secs(2) => {
+                    self.reply(format!("err {id} send() dropped: modifiers held for over 2 s"));
+                }
+                Out::Text(text) => self.type_text(id, &text, 0),
+                Out::Keys(c) => self.tap(c),
             }
         }
     }
@@ -242,9 +263,77 @@ impl State {
         self.inject(&keys);
     }
 
+    /// Press and release `c` with its modifiers. A single-letter key is looked up
+    /// in the layout, so `ctrl+z` means the key labelled Z on AZERTY too.
+    fn tap(&mut self, c: Combo) {
+        let name = keysmith::key_name(c.key);
+        let mut ch = name.chars();
+        let key = match (ch.next(), ch.next(), self.layout.as_ref()) {
+            (Some(one), None, Some((l, _))) => l.key_for(one).unwrap_or(c.key),
+            _ => c.key,
+        };
+        use KeyCode as K;
+        let mods: Vec<_> = [(CTRL, K::KEY_LEFTCTRL), (ALT, K::KEY_LEFTALT), (SHIFT, K::KEY_LEFTSHIFT), (SUPER, K::KEY_LEFTMETA)]
+            .into_iter()
+            .filter(|(bit, _)| c.mods & bit != 0)
+            .map(|(_, k)| k)
+            .collect();
+        let keys: Vec<_> = mods
+            .iter()
+            .map(|m| (*m, 1))
+            .chain([(key, 1), (key, 0)])
+            .chain(mods.iter().rev().map(|m| (*m, 0)))
+            .collect();
+        self.inject(&keys);
+    }
+
+    /// Ctrl+Alt+Shift+R toggles recording; while on, desktop-bound keys go to the client.
+    fn record(&mut self, k: KeyCode, v: i32) {
+        if v == 1 && k == KeyCode::KEY_R && self.m.mods() == CTRL | ALT | SHIFT {
+            match (&self.rec, &self.client) {
+                (Some(_), _) => self.rec_stop("stopped"),
+                (None, Some((_, _, uid))) if active_uid() == Some(*uid) => {
+                    eprintln!("recording started");
+                    self.rec = Some(Rec { start: Instant::now(), down: HashSet::new(), n: 0 });
+                    self.reply("rec start".into());
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(r) = self.rec.as_mut() else { return };
+        if r.start.elapsed() >= Duration::from_secs(RECORD_SECS) {
+            return self.rec_stop("time limit");
+        }
+        let keep = match v {
+            1 => {
+                r.down.insert(k);
+                true
+            }
+            0 => r.down.remove(&k),
+            _ => false,
+        };
+        if keep {
+            r.n += 1;
+            let (line, full) = (format!("rec {} {v} {}", k.code(), r.start.elapsed().as_millis()), r.n >= RECORD_MAX);
+            self.reply(line);
+            if full {
+                self.rec_stop("key limit");
+            }
+        }
+    }
+
+    fn rec_stop(&mut self, why: &str) {
+        if self.rec.take().is_some() {
+            eprintln!("recording stopped: {why}");
+            self.reply(format!("rec stop {why}"));
+        }
+    }
+
     /// Every key event the desktop sees (post-remap when grabbed).
     fn seen(&mut self, k: KeyCode, v: i32) {
         self.hotkey(k, v);
+        self.record(k, v);
         let Some((_, dec)) = self.layout.as_mut() else { return };
         let c = dec.feed(k, v);
         if v == 0 && self.fire_on_release.is_some_and(|(fk, ..)| fk == k) {
@@ -312,8 +401,17 @@ impl State {
                 None
             }
             Ok(Msg::Type(id, text)) => {
-                self.queued.push_back((id, text, Instant::now()));
+                self.queued.push_back((id, Out::Text(text), Instant::now()));
                 self.flush_queue();
+                None
+            }
+            Ok(Msg::Key(id, c)) => {
+                self.queued.push_back((id, Out::Keys(c), Instant::now()));
+                self.flush_queue();
+                None
+            }
+            Ok(Msg::RecordStop) => {
+                self.rec_stop("focus changed");
                 None
             }
             Ok(Msg::Pasted(id, shift)) => {
@@ -407,14 +505,19 @@ fn main() -> std::io::Result<()> {
         fire_on_release: None,
         pending_paste: None,
         queued: VecDeque::new(),
+        rec: None,
     };
     loop {
-        let ev = match s.r.deadline() {
+        let rec_end = s.rec.as_ref().map(|r| r.start + Duration::from_secs(RECORD_SECS));
+        let ev = match [s.r.deadline(), rec_end].into_iter().flatten().min() {
             Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match ev {
             Err(RecvTimeoutError::Timeout) => {
+                if rec_end.is_some_and(|e| Instant::now() >= e) {
+                    s.rec_stop("time limit");
+                }
                 let out = s.r.tick(Instant::now());
                 s.emit(&out);
                 for (k, v) in out {

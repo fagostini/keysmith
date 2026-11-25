@@ -15,6 +15,7 @@ ext=keysmith@fagostini.github.io
 install -Dm644 -t "$PREFIX/share/gnome-shell/extensions/$ext" data/gnome-extension/$ext/*
 install -Dm644 -t "$PREFIX/share/doc/keysmith/examples" examples/hotkeys.conf
 install -Dm644 -t "$PREFIX/share/doc/keysmith/examples/scripts" examples/scripts/*
+install -Dm644 -t "$PREFIX/share/doc/keysmith/examples/ahk" examples/ahk/*
 
 systemctl daemon-reload
 systemctl enable --now ks-inputd.service
