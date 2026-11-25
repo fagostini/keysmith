@@ -17,7 +17,7 @@ optdepends=('xclip: paste characters your layout cannot type (X11)'
             'libnotify: error notifications')
 install=keysmith.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('697e79101bad8f8f4e323d99b73f9d13f9e0ced2f1c9bfec0ae3396c2b0a2904')
 
 prepare() {
   cd "$pkgname-$pkgver"
